@@ -133,42 +133,27 @@ class TransformerModel(nn.Module):
 
     def logits(self, source, prev_outputs, **unused):
         bsz, src_len = source.shape
-        #获取源序列批次大小和源序列长度
         out_len = prev_outputs.size(1)
-        #获取目标序列长度
         device = source.device
         source = source.transpose(0, 1)
-        #源序列组行列转换
-        source = self.encoder(source)#验证时，source维度从（3，16）-----》（3，16，256）
-        #进行编码
+        source = self.encoder(source)
         source += self.pos_encoder(bsz, 0, src_len)
-        #将位置编码添加进源序列
         mask = self._generate_square_subsequent_mask(prev_outputs.size(-1))
-        #掩码生成
-        prev_outputs = prev_outputs.transpose(0, 1)#验证时，pre_outputs维度从（16，1）————————》（1，16）  
-        prev_outputs = self.encoder(prev_outputs)#验证时，pre_outputs维度从（1，16）————————》（1，16，256）
-        #目标序列转换 编码
+        prev_outputs = prev_outputs.transpose(0, 1)
+        prev_outputs = self.encoder(prev_outputs)
         prev_outputs += self.pos_encoder(bsz, src_len, out_len)
-        #将位置编码添加进目标序列
         if self.args.encoder:
             enmask = torch.zeros(out_len + src_len, out_len + src_len)
             enmask[:, src_len:] = float("-inf")
             enmask[src_len:, src_len:] = mask 
             enmask = enmask.to(device)
             imput = torch.cat((source, prev_outputs), dim=0)
-            #创建一个全是0的掩码 对角线上的元素为负无穷
             output = self.enencoder(imput, mask=enmask)[src_len:, :, :].transpose(0, 1)
             # output = self.enencoder(torch.cat((source, prev_outputs), dim=0), mask=enmask)[src_len:, :, :].transpose(0, 1)
-            #首先将源序列和目标序列沿着0维度进行拼接
-            #使用掩码遮挡 使用TransformerEncoder进行编码
-            #选择输出目标序列编码
-            #转换行列
         else:
             mask = mask.to(device)
             output = self.endecoder(source, prev_outputs, tgt_mask=mask).transpose(0, 1)
-            #没有参与程序运行 论文中没有transformer解码器参与
         logits = torch.mm(self.glue(self.fc(output)).view(-1, self.ninp), self.encoder.weight.transpose(0, 1)).view(bsz, out_len, -1)
-        #批次大小 目标序列长度 最后一个维度的大小由前面数据的计算获得
         return logits
 
     def get_loss(self, source, prev_outputs, target, mask, **unused):
@@ -196,62 +181,42 @@ class TransformerModel(nn.Module):
 class KGReasoning(nn.Module):
     def __init__(self, args, device, adj_list):
         super(KGReasoning, self).__init__()
-        self.nentity = args.nentity#实体数量
-        self.nrelation = args.nrelation#关系数量
-        self.device = device#运行设备
-        self.relation_embeddings = list()#存储关系嵌入
-        self.fraction = args.fraction#注释为将实体分段减少对GPU内存的使用
-        # self.query_name_dict = query_name_dict#查询形式 不需要
-        # self.name_answer_dict = name_answer_dict#答案形式 不需要
-        self.neg_scale = args.neg_scale#负样本缩放因子
-        #数据集的名称不同不再使用“-”进行分割,这里的代码需要重写#################################
+        self.nentity = args.nentity
+        self.nrelation = args.nrelation
+        self.device = device
+        self.relation_embeddings = list()
+        self.fraction = args.fraction
+        # self.query_name_dict = query_name_dict
+        # self.name_answer_dict = name_answer_dict
+        self.neg_scale = args.neg_scale
         dataset_name = args.dataset
         # if args.data_path.split('/')[1].split('-')[1] == "237":
         #     dataset_name += "-237"
         filename = 'neural_adj/'+dataset_name+'_'+str(args.fraction)+'_'+str(args.thrshd)+'.pt'
-        #这里的thrshd参数是神经矩阵阈值
-        #这里新建的是一个pytorch模型的序列化文件，用来保存模型
-        ####################################################################################
-        #对于内存过大的数据集采用邻接矩阵的方式存储实体之间的关系
-
-
-        #这里将模型的最佳轮次加载进模型对后续的尾实体集合进行重新排序
         if args.test:
             kbc_model = load_kbc(args.kbc_path, device, args.nentity, args.nrelation)
 
         if os.path.exists(filename):
             self.relation_embeddings = torch.load(filename, map_location=device)
-            #如果这个模型文件存在，加载关系嵌入
-            #这里一定是不存在的
         else:
-            #加载对不同数据集训练的模型 --kbc_path kbc/FB15K/best_valid.model其中一个参数的示例
-            #这里的实体和关系数量由主函数为参数赋值
             kbc_model = load_kbc(args.kbc_path, device, args.nentity, args.nrelation)
-            #将训练好的模型载入
             for i in tqdm(range(args.nrelation)):
                 relation_embedding = neural_adj_matrix(kbc_model, i, args.nentity, device, args.thrshd, adj_list[i])
-                #为每一个关系r构建一个nentity X nentity大小的张量存储 由KGE模型计算出的 两个实体之间的关系r的概率 低于thrshd的被舍弃
                 relation_embedding = (relation_embedding>=1).to(torch.float) * 0.9999 + (relation_embedding<1).to(torch.float) * relation_embedding
-                #标准化概率分数 大于1的变成0.9999 小于1的不变 都是浮点数
                 for (h, t) in adj_list[i]: 
                     relation_embedding[h, t] = 1.
-                #将关系嵌入中的存在的头实体和尾实体对设置为1
                 # add fractional
-                fractional_relation_embedding = []#用于存储分段的关系嵌入
-                dim = args.nentity // args.fraction#每个分段维度大小
-                rest = args.nentity - args.fraction * dim#计算分段后剩余实体数量
+                fractional_relation_embedding = []
+                dim = args.nentity // args.fraction
+                rest = args.nentity - args.fraction * dim
                 for i in range(args.fraction):
-                    s = i * dim #s为分段的启示索引
-                    t = (i+1) * dim#t为分段的结束索引
+                    s = i * dim 
+                    t = (i+1) * dim
                     if i == args.fraction - 1:
-                        t += rest #最后一段索引将剩余量加上
+                        t += rest 
                     fractional_relation_embedding.append(relation_embedding[s:t, :].to_sparse().to(self.device))
-                    #将当前分段的关系嵌入添加到列表中，并转换为稀疏张量格式，移动到指定的设备。
                 self.relation_embeddings.append(fractional_relation_embedding)
-                #将分段的关系嵌入添加到 self.relation_embeddings 列表中
             torch.save(self.relation_embeddings, filename)
-            #
-            #这里初始化模型后为每一个关系构建了一个实体X实体大小的概率矩阵 存在内存不足问题
 
     def relation_projection(self, embedding, r_embedding, is_neg=False):
         dim = self.nentity // self.fraction
@@ -385,8 +350,6 @@ class KGReasoning(nn.Module):
             ans.append(anchor)
             return ans, ele_ent
         
-
-#增添的新函数
 def load_kbc(model_path, device, nentity, nrelation):
     model = ComplEx(sizes=[nentity, nrelation, nentity], rank=1000, init_size=1e-3)
     state_dict = torch.load(model_path)
